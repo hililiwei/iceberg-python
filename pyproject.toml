@@ -45,6 +45,11 @@ include = [
   { path = "pyiceberg/**/*.pyd", format = "wheel" },
 ]
 
+[[tool.poetry.source]]
+name = "mirrors"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+priority = "primary"
+
 [tool.poetry.dependencies]
 python = "^3.8"
 mmh3 = ">=4.0.0,<5.0.0"
