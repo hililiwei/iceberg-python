@@ -1284,6 +1284,7 @@ class TableScan(ABC):
     row_filter: BooleanExpression
     selected_fields: Tuple[str, ...]
     case_sensitive: bool
+    snapshot_id: Optional[int]
     options: Properties
     limit: Optional[int]
 
@@ -1293,6 +1294,7 @@ class TableScan(ABC):
         row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
         selected_fields: Tuple[str, ...] = ("*",),
         case_sensitive: bool = True,
+        snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
     ):
@@ -1300,14 +1302,29 @@ class TableScan(ABC):
         self.row_filter = _parse_row_filter(row_filter)
         self.selected_fields = selected_fields
         self.case_sensitive = case_sensitive
+        self.snapshot_id = snapshot_id
         self.options = options
         self.limit = limit
 
     def snapshot(self) -> Optional[Snapshot]:
+        if self.snapshot_id:
+            return self.table.snapshot_by_id(self.snapshot_id)
         return self.table.current_snapshot()
 
     def projection(self) -> Schema:
         current_schema = self.table.schema()
+        if self.snapshot_id is not None:
+            snapshot = self.table.snapshot_by_id(self.snapshot_id)
+            if snapshot is not None:
+                if snapshot.schema_id is not None:
+                    snapshot_schema = self.table.schemas().get(snapshot.schema_id)
+                    if snapshot_schema is not None:
+                        current_schema = snapshot_schema
+                    else:
+                        warnings.warn(f"Metadata does not contain schema with id: {snapshot.schema_id}")
+            else:
+                raise ValueError(f"Snapshot not found: {self.snapshot_id}")
+
         if "*" in self.selected_fields:
             return current_schema
 
@@ -1326,8 +1343,13 @@ class TableScan(ABC):
         """Create a copy of this table scan with updated fields."""
         return type(self)(**{**self.__dict__, **overrides})
 
-    @abstractmethod
-    def use_ref(self: S, name: str) -> S: ...
+    def use_ref(self: S, name: str) -> S:
+        if self.snapshot_id:
+            raise ValueError(f"Cannot override ref, already set snapshot id={self.snapshot_id}")
+        if snapshot := self.table.snapshot_by_name(name):
+            return self.update(snapshot_id=snapshot.snapshot_id)
+
+        raise ValueError(f"Cannot scan unknown ref={name}")
 
     def select(self: S, *field_names: str) -> S:
         if "*" in self.selected_fields:
@@ -1417,17 +1439,18 @@ def _match_deletes_to_data_file(data_entry: ManifestEntry, positional_delete_ent
         return set()
 
 
-class BaseScan(TableScan):
+class DataScan(TableScan):
     def __init__(
         self,
         table: Table,
         row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
         selected_fields: Tuple[str, ...] = ("*",),
         case_sensitive: bool = True,
+        snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
     ):
-        super().__init__(table, row_filter, selected_fields, case_sensitive, options, limit)
+        super().__init__(table, row_filter, selected_fields, case_sensitive, snapshot_id, options, limit)
 
     def _build_partition_projection(self, spec_id: int) -> BooleanExpression:
         project = visitors.inclusive_projection(self.table.schema(), self.table.specs()[spec_id])
@@ -1469,86 +1492,6 @@ class BaseScan(TableScan):
             manifest.content == ManifestContent.DELETES
             and (manifest.sequence_number or INITIAL_SEQUENCE_NUMBER) >= min_data_sequence_number
         )
-
-    def to_arrow(self) -> pa.Table:
-        from pyiceberg.io.pyarrow import project_table
-
-        return project_table(
-            self.plan_files(),
-            self.table,
-            self.row_filter,
-            self.projection(),
-            case_sensitive=self.case_sensitive,
-            limit=self.limit,
-        )
-
-    def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
-        return self.to_arrow().to_pandas(**kwargs)
-
-    def to_duckdb(self, table_name: str, connection: Optional[DuckDBPyConnection] = None) -> DuckDBPyConnection:
-        import duckdb
-
-        con = connection or duckdb.connect(database=":memory:")
-        con.register(table_name, self.to_arrow())
-
-        return con
-
-    def to_ray(self) -> ray.data.dataset.Dataset:
-        import ray
-
-        return ray.data.from_arrow(self.to_arrow())
-
-    @abstractmethod
-    def plan_files(self) -> Iterable[FileScanTask]: ...
-
-
-class DataScan(BaseScan):
-    snapshot_id: Optional[int]
-
-    def __init__(
-        self,
-        table: Table,
-        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
-        selected_fields: Tuple[str, ...] = ("*",),
-        case_sensitive: bool = True,
-        snapshot_id: Optional[int] = None,
-        options: Properties = EMPTY_DICT,
-        limit: Optional[int] = None,
-    ):
-        super().__init__(table, row_filter, selected_fields, case_sensitive, options, limit)
-        self.snapshot_id = snapshot_id
-
-    def snapshot(self) -> Optional[Snapshot]:
-        if self.snapshot_id:
-            return self.table.snapshot_by_id(self.snapshot_id)
-        return self.table.current_snapshot()
-
-    def projection(self) -> Schema:
-        current_schema = self.table.schema()
-        if self.snapshot_id is not None:
-            snapshot = self.table.snapshot_by_id(self.snapshot_id)
-            if snapshot is not None:
-                if snapshot.schema_id is not None:
-                    snapshot_schema = self.table.schemas().get(snapshot.schema_id)
-                    if snapshot_schema is not None:
-                        current_schema = snapshot_schema
-                    else:
-                        warnings.warn(f"Metadata does not contain schema with id: {snapshot.schema_id}")
-            else:
-                raise ValueError(f"Snapshot not found: {self.snapshot_id}")
-
-        if "*" in self.selected_fields:
-            return current_schema
-
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
-
-    def use_ref(self: S, name: str) -> S:
-        if self.snapshot_id:
-            raise ValueError(f"Cannot override ref, already set snapshot id={self.snapshot_id}")
-        if snapshot := self.table.snapshot_by_name(name):
-            return self.update(snapshot_id=snapshot.snapshot_id)
-
-        raise ValueError(f"Cannot scan unknown ref={name}")
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files by filtering on the PartitionSpecs.
@@ -1623,8 +1566,36 @@ class DataScan(BaseScan):
             for data_entry in data_entries
         ]
 
+    def to_arrow(self) -> pa.Table:
+        from pyiceberg.io.pyarrow import project_table
 
-class IncrementalAppendScan(BaseScan):
+        return project_table(
+            self.plan_files(),
+            self.table,
+            self.row_filter,
+            self.projection(),
+            case_sensitive=self.case_sensitive,
+            limit=self.limit,
+        )
+
+    def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
+        return self.to_arrow().to_pandas(**kwargs)
+
+    def to_duckdb(self, table_name: str, connection: Optional[DuckDBPyConnection] = None) -> DuckDBPyConnection:
+        import duckdb
+
+        con = connection or duckdb.connect(database=":memory:")
+        con.register(table_name, self.to_arrow())
+
+        return con
+
+    def to_ray(self) -> ray.data.dataset.Dataset:
+        import ray
+
+        return ray.data.from_arrow(self.to_arrow())
+
+
+class IncrementalAppendScan(DataScan):
     to_snapshot_id: Optional[int]
     from_snapshot_id_exclusive: Optional[int]
 
@@ -1634,12 +1605,13 @@ class IncrementalAppendScan(BaseScan):
         row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
         selected_fields: Tuple[str, ...] = ("*",),
         case_sensitive: bool = True,
+        snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
         to_snapshot_id: Optional[int] = None,
         from_snapshot_id_exclusive: Optional[int] = None,
     ):
-        super().__init__(table, row_filter, selected_fields, case_sensitive, options, limit)
+        super().__init__(table, row_filter, selected_fields, case_sensitive, snapshot_id, options, limit)
         self.to_snapshot_id = to_snapshot_id
         self.from_snapshot_id_exclusive = from_snapshot_id_exclusive
 
@@ -1680,9 +1652,13 @@ class IncrementalAppendScan(BaseScan):
                     f"Starting snapshot (exclusive) {self.from_snapshot_id_exclusive} is not a parent ancestor of end snapshot {self.to_snapshot_id}"
                 )
 
-        snapshots_between = list(ancestors_between(self.to_snapshot_id, self.from_snapshot_id_exclusive, self.table))
+        snapshots_between = [
+            snapshot
+            for snapshot in ancestors_between(self.to_snapshot_id, self.from_snapshot_id_exclusive, self.table)
+            if snapshot.summary.operation == Operation.APPEND  # type: ignore
+        ]
 
-        snapshot_ids = [snapshot.snapshot_id for snapshot in snapshots_between]
+        snapshot_ids = {snapshot.snapshot_id for snapshot in snapshots_between}
 
         io = self.table.io
 
@@ -3192,7 +3168,6 @@ def oldest_ancestor_of(snapshot_id: int, table: Table) -> Optional[int]:
     last_snapshot = None
     for snapshot in ancestors_of(table.snapshot_by_id(snapshot_id), table):  # type: ignore
         last_snapshot = snapshot.snapshot_id
-
     return last_snapshot
 
 
